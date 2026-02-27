@@ -1,0 +1,418 @@
+---
+title: "GSE183947 Bulk RNA-seq (FPKM) Tumor vs Adjacent Normal — Reproducible Analysis Report"
+author: "Sophie Tran"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: true
+    code-tools: true
+    theme: cosmo
+execute:
+  echo: true
+  warning: false
+  message: false
+  cache: false
+---
+
+## Overview
+
+This report demonstrates an end-to-end **bulk RNA-seq** analysis workflow using GEO dataset **GSE183947**. The dataset provides a supplementary **FPKM expression matrix** (not raw integer counts). Therefore, differential expression is performed with **limma-trend** on `log2(FPKM + 1)` values (FPKM-appropriate), rather than DESeq2 (which requires raw counts).
+
+### Goals
+
+-   Download and load the GEO supplementary FPKM matrix
+-   Construct and verify sample annotations (Tumor vs Normal)
+-   Perform QC (distribution, PCA, correlation)
+-   Filter low-expression genes
+-   Run differential expression (limma-trend)
+-   Generate standard outputs (volcano plot, heatmap, marker check)
+-   Save figures and tables for sharing/review
+
+------------------------------------------------------------------------
+
+## Setup
+
+```{r}
+rm(list = ls())
+set.seed(123)
+```
+
+## Create output folders
+
+```{r}
+dir.create("results", showWarnings = FALSE)
+dir.create("results/figures", showWarnings = FALSE)
+dir.create("results/tables", showWarnings = FALSE)
+```
+
+## Packages
+
+```{r}
+pkgs <- c(
+  "GEOquery", "dplyr", "tibble", "stringr", "tidyr",
+  "ggplot2", "limma", "pheatmap", "matrixStats"
+)
+
+to_install <- pkgs[!pkgs %in% rownames(installed.packages())]
+if (length(to_install) > 0) install.packages(to_install, dependencies = TRUE)
+
+library(GEOquery)
+library(dplyr)
+library(tibble)
+library(stringr)
+library(tidyr)
+library(ggplot2)
+library(limma)
+library(pheatmap)
+library(matrixStats)
+```
+
+## Data acquisition (GEO supplementary file)
+
+```{r}
+gse_id <- "GSE183947"
+
+# Download supplementary files into folder ./GSE183947/
+getGEOSuppFiles(gse_id, makeDirectory = TRUE)
+
+fpkm_path <- file.path(gse_id, paste0(gse_id, "_fpkm.csv.gz"))
+if (!file.exists(fpkm_path)) {
+  stop("FPKM file not found. Check list.files('GSE183947') for exact filename.")
+}
+
+counts_raw <- read.csv(
+  fpkm_path,
+  row.names = 1,
+  check.names = FALSE
+)
+
+counts_raw <- as.matrix(counts_raw)
+storage.mode(counts_raw) <- "numeric"
+
+dim(counts_raw)
+```
+
+### Notes on input data
+
+-   This file contains **FPKM** values (continuous, normalized) rather than raw counts.
+
+<!-- -->
+
+-   Because of this, we use **limma-trend** (linear modeling + empirical Bayes) on `log2(FPKM+1)`
+
+## Sample annotation (Tumor vs Normal)
+
+The column naming convention in the FPKM matrix indicates sample groups:
+
+-   CA.\* = Tumor (Cancer)
+
+-   CAP.\* = Adjecent/normal tissue (Cancer Adjecent Paratumor) -\> treated as Normal here
+
+    ```{r}
+    sample_info <- data.frame(
+      sample_id = colnames(counts_raw),
+      condition = ifelse(grepl("^CA\\.", colnames(counts_raw)), "Tumor",
+                         ifelse(grepl("^CAP\\.", colnames(counts_raw)), "Normal", NA_character_))
+    )
+
+    if (any(is.na(sample_info$condition))) {
+      bad <- sample_info %>% filter(is.na(condition))
+      stop("Some samples did not match CA./CAP. pattern:\n", paste(bad$sample_id, collapse = ", "))
+    }
+
+    sample_info$condition <- factor(sample_info$condition, levels = c("Normal", "Tumor"))
+    rownames(sample_info) <- sample_info$sample_id
+
+    table(sample_info$condition)
+    ```
+
+```{r}
+write.csv(sample_info, "results/tables/sample_info.csv", row.names = TRUE)
+```
+
+## QC (FPKM-aware)
+
+### 1) Sample-level sum of FPKM (not true library size)
+
+Because values are FPKM, the sum across genes is not a sequencing library size. However, it can still flag samples with unusual overall expression magnitude.
+
+```{r}
+sample_totals <- colSums(counts_raw, na.rm = TRUE)
+qc_df <- data.frame(
+  sample_id = names(sample_totals),
+  total_fpkm_sum = as.numeric(sample_totals),
+  condition = sample_info[names(sample_totals), "condition"]
+) %>% arrange(desc(total_fpkm_sum))
+
+p_totals <- ggplot(qc_df, aes(x = reorder(sample_id, total_fpkm_sum),
+                              y = total_fpkm_sum / 1e6,
+                              fill = condition)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "QC: Sum(FPKM) per sample (not true library size)",
+    x = NULL,
+    y = "Sum(FPKM) (millions)",
+    fill = "Condition"
+  ) +
+  theme_minimal(base_size = 12)
+
+p_totals
+```
+
+```{r}
+ggsave("results/figures/qc_sum_fpkm_per_sample.png", p_totals, width = 10, height = 7, dpi = 150)
+```
+
+### 2) Distribution of log2(FPKM+1)
+
+```{r}
+expr_log <- log2(counts_raw + 1)
+
+boxplot(expr_log,
+        outline = FALSE,
+        las = 2,
+        main = "QC: log2(FPKM+1) distribution per sample",
+        ylab = "log2(FPKM + 1)")
+```
+
+## Filtering low-expression genes
+
+Criterion used:
+
+-   Keep genes with FPKM \> 1 at least 5 samples
+
+```{r}
+keep <- rowSums(counts_raw > 1) >= 5
+cat("Genes before filtering:", nrow(counts_raw), "\n")
+cat("Genes after filtering :", sum(keep), "\n")
+
+counts_f <- counts_raw[keep, , drop = FALSE]
+expr_f <- log2(counts_f + 1)
+```
+
+## PCA (sample QC/ group separation)
+
+```{r}
+pca <- prcomp(t(expr_f), scale. = TRUE)
+
+pca_df <- data.frame(
+  PC1 = pca$x[, 1],
+  PC2 = pca$x[, 2],
+  sample_id = rownames(pca$x),
+  condition = sample_info[rownames(pca$x), "condition"]
+)
+
+p_pca <- ggplot(pca_df, aes(x = PC1, y = PC2, color = condition)) +
+  geom_point(size = 3, alpha = 0.9) +
+  labs(title = "PCA of log2(FPKM+1) (filtered genes)") +
+  theme_minimal(base_size = 12)
+
+p_pca
+```
+
+```{r}
+ggsave("results/figures/qc_pca.png", p_pca, width = 8, height = 6, dpi = 150)
+```
+
+## Sample correlation heatmap
+
+```{r}
+cor_mat <- cor(expr_f, method = "pearson")
+
+ann_col <- data.frame(condition = sample_info$condition)
+rownames(ann_col) <- rownames(sample_info)
+
+pheatmap(cor_mat,
+         annotation_col = ann_col,
+         show_rownames = FALSE,
+         show_colnames = FALSE,
+         main = "Sample correlation heatmap (log2 FPKM+1)")
+```
+
+```{r}
+png("results/figures/qc_sample_correlation_heatmap.png", width = 1100, height = 900, res = 150)
+pheatmap(cor_mat,
+         annotation_col = ann_col,
+         show_rownames = FALSE,
+         show_colnames = FALSE,
+         main = "Sample correlation heatmap (log2 FPKM+1)")
+dev.off()
+```
+
+## Differential expression (limma-trend)
+
+-   Reference level: Normal
+
+-   Coefficient: conditionTumor (Tumor vs Normal)
+
+    ```{r}
+    design <- model.matrix(~ condition, data = sample_info)
+
+    fit <- lmFit(expr_f, design)
+    fit <- eBayes(fit, trend = TRUE)
+
+    res <- topTable(fit, coef = "conditionTumor", number = Inf, sort.by = "P")
+    res$gene <- rownames(res)
+
+    head(res[, c("gene", "logFC", "AveExpr", "P.Value", "adj.P.Val")], 10)
+    ```
+
+```{r}
+write.csv(res, "results/tables/limma_DE_Tumor_vs_Normal.csv", row.names = FALSE)
+```
+
+## Volcano plot
+
+```{r}
+res2 <- res %>%
+  mutate(
+    neglog10FDR = -log10(adj.P.Val + 1e-300),
+    sig = adj.P.Val < 0.05 & abs(logFC) >= 1
+  )
+
+p_volcano <- ggplot(res2, aes(x = logFC, y = neglog10FDR)) +
+  geom_point(aes(shape = sig), alpha = 0.6) +
+  labs(
+    title = "Volcano plot (limma-trend on log2(FPKM+1))",
+    x = "log2 fold change (Tumor vs Normal)",
+    y = "-log10(FDR)"
+  ) +
+  theme_minimal(base_size = 12)
+
+p_volcano
+```
+
+```{r}
+ggsave("results/figures/de_volcano.png", p_volcano, width = 8, height = 6, dpi = 150)
+```
+
+## Heatmap of top 50 DE genes
+
+```{r}
+top50 <- res %>%
+  arrange(adj.P.Val) %>%
+  slice(1:50) %>%
+  pull(gene)
+
+mat_top <- expr_f[top50, , drop = FALSE]
+
+# Z-score by gene for visualization
+mat_top_z <- t(scale(t(mat_top)))
+
+pheatmap(mat_top_z,
+         annotation_col = ann_col,
+         show_colnames = FALSE,
+         fontsize_row = 8,
+         main = "Top 50 DE genes (z-scored, log2 FPKM+1)")
+```
+
+```{r}
+png("results/figures/de_heatmap_top50.png", width = 1100, height = 1200, res = 150)
+pheatmap(mat_top_z,
+         annotation_col = ann_col,
+         show_colnames = FALSE,
+         fontsize_row = 8,
+         main = "Top 50 DE genes (z-scored, log2 FPKM+1)")
+dev.off()
+```
+
+## Canonical marker check
+
+```{r}
+markers <- c("ESR1", "ERBB2", "MKI67", "TP53", "KRT19")
+
+marker_res <- res %>%
+  dplyr::filter(gene %in% markers) %>%
+  dplyr::select(gene, logFC, AveExpr, P.Value, adj.P.Val)
+
+marker_res
+```
+
+```{r}
+write.csv(marker_res, "results/tables/marker_check.csv", row.names = FALSE)
+```
+
+Interpretation guidance:
+
+-   LogFC \> 0 -\> higher in Tumor
+
+-   LogFC \< 0 -\> higher in Normal
+
+## Notes on limitations
+
+-   This analysis begins from an FPKM matrix supplied by GEO, so upstream steps (alignment/quantification from FASTQ) are not reproduced here.
+
+-   For raw-count workflows, tools such as STAR/Hisat2 + featureCounts/HTSeq + DESeq2 would be appropriate.
+
+## Key findings
+
+### Differential Expression Summary
+
+```{r}
+# Number of significant genes
+n_sig <- sum(res$adj.P.Val < 0.05)
+n_up  <- sum(res$adj.P.Val < 0.05 & res$logFC > 0)
+n_dn  <- sum(res$adj.P.Val < 0.05 & res$logFC < 0)
+
+summary_df <- data.frame(
+  Metric = c("Total genes tested",
+             "Significant genes (FDR < 0.05)",
+             "Upregulated in Tumor",
+             "Higher in Normal"),
+  Value = c(nrow(res), n_sig, n_up, n_dn)
+)
+
+summary_df
+```
+
+### Top 10 Upregulated Genes in Tumor
+
+```{r}
+top_up <- res %>%
+  dplyr::filter(adj.P.Val < 0.05, logFC > 0) %>%
+  dplyr::arrange(adj.P.Val) %>%
+  dplyr::select(gene, logFC, adj.P.Val) %>%
+  head(10)
+
+top_up
+```
+
+### Top 10 Genes Higher in Normal Tissue
+
+```{r}
+top_dn <- res %>%
+  dplyr::filter(adj.P.Val < 0.05, logFC < 0) %>%
+  dplyr::arrange(adj.P.Val) %>%
+  dplyr::select(gene, logFC, adj.P.Val) %>%
+  head(10)
+
+top_dn
+```
+
+### Canonical Breast Cancer Marker Summary
+
+```{r}
+marker_res
+```
+
+## Interpretation
+
+```{r}
+cat("
+This bulk RNA-seq analysis identified", n_sig,
+"genes significantly differentially expressed (FDR < 0.05) between tumor and adjacent normal tissue.
+
+Of these,",
+n_up, "genes were upregulated in tumor samples, while",
+n_dn, "genes showed higher expression in normal tissue.
+
+Upregulated tumor genes include proliferation-associated and epithelial markers, 
+consistent with malignant transformation and increased cellular proliferation.
+
+Reduced expression of hormone receptor markers in tumor samples suggests 
+potential subtype heterogeneity or reduced hormone receptor signaling in this cohort.
+")
+```
